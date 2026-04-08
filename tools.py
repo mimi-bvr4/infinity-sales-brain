@@ -565,6 +565,56 @@ def lookup_deal(query: str) -> dict:
     }
 
 
+def _get_gmail_service():
+    """
+    Returns an authenticated Gmail API service using domain-wide delegation.
+    The service account impersonates salesbrain@infinityhospitality.net to send emails.
+    """
+    try:
+        from googleapiclient.discovery import build
+        GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
+
+        # Option 1: Service account JSON in env var (deployment)
+        sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+        if sa_json:
+            from google.oauth2 import service_account
+            import json as _json
+            info = _json.loads(sa_json)
+            creds = service_account.Credentials.from_service_account_info(info, scopes=GMAIL_SCOPES)
+            delegated = creds.with_subject(SALES_BRAIN_EMAIL)
+            return build("gmail", "v1", credentials=delegated)
+
+        # Option 2: Service account key file
+        sa_path = os.environ.get("GOOGLE_SERVICE_ACCOUNT_KEY", "")
+        if sa_path and os.path.exists(sa_path):
+            from google.oauth2 import service_account
+            creds = service_account.Credentials.from_service_account_file(sa_path, scopes=GMAIL_SCOPES)
+            delegated = creds.with_subject(SALES_BRAIN_EMAIL)
+            return build("gmail", "v1", credentials=delegated)
+
+        return None
+    except Exception as e:
+        print(f"Gmail auth error: {e}")
+        return None
+
+
+def _build_email(to_list: list, cc_list: list, subject: str, body_html: str, from_email: str) -> str:
+    """Build a MIME email message encoded for the Gmail API."""
+    import base64
+    from email.mime.text import MIMEText
+
+    msg = MIMEText(body_html, "html")
+    msg["From"] = f"Sales Brain <{from_email}>"
+    msg["To"] = ", ".join(to_list)
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
+    msg["Subject"] = subject
+    msg["Reply-To"] = from_email
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+    return raw
+
+
 def send_escalation(
     level: str,
     question: str,
@@ -574,67 +624,110 @@ def send_escalation(
     tentative_answer: str = ""
 ) -> dict:
     """
-    Send an escalation email to the leadership group.
+    Send an escalation email to the leadership group via Gmail API.
     YELLOW: answer + flag for review
     RED: full escalation, no confident answer
+    Falls back to 'prepared but not sent' if Gmail is not connected.
     """
     emoji = "🟡" if level == "YELLOW" else "🔴"
     subject = f"{emoji} Sales Brain Escalation — {question[:60]}"
 
     to_list = [m["email"] for m in ESCALATION_GROUP]
+    cc_list = [asker_email] if asker_email else []
 
-    # Build email body with LEARN/DON'T LEARN toggle placeholder
-    body_lines = [
-        f"**Escalation Level:** {emoji} {level}",
-        f"**Asked by:** {asker_name} ({asker_email})",
-        f"**Date/Time:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M CT')}",
-        "",
-        f"**Question:** {question}",
-        "",
-        f"**Context:** {context}",
-    ]
+    # Build HTML email body
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M CT")
 
     if tentative_answer:
-        body_lines.extend([
-            "",
-            f"**Brain's Tentative Answer:** {tentative_answer}",
-            "",
-            "*This answer was delivered to the sales team member with a yellow confidence indicator.*",
-            "*Please confirm or correct.*",
-        ])
+        answer_section = f"""
+        <div style="background:#fff8e1;border-left:4px solid #ffc107;padding:12px;margin:16px 0;">
+            <strong>Brain's Tentative Answer:</strong><br>{tentative_answer}
+        </div>
+        <p><em>This answer was delivered to the sales team member with a yellow confidence indicator. Please confirm or correct.</em></p>
+        """
     else:
-        body_lines.extend([
-            "",
-            "*The Brain could not provide a confident answer for this question.*",
-            "*Please reply with the correct answer.*",
-        ])
+        answer_section = """
+        <div style="background:#ffebee;border-left:4px solid #f44336;padding:12px;margin:16px 0;">
+            <strong>The Brain could not provide a confident answer for this question.</strong>
+        </div>
+        <p><em>Please reply with the correct answer.</em></p>
+        """
 
-    body_lines.extend([
-        "",
-        "─────────────────────────────────",
-        "**When you reply, please indicate:**",
-        "",
-        "✅ LEARN — Add this answer to the Sales Brain's permanent knowledge",
-        "⛔ DON'T LEARN — Log this answer but do NOT add to permanent knowledge (one-off exception)",
-        "",
-        "Default: DON'T LEARN. Only mark LEARN if this should become standard knowledge.",
-        "─────────────────────────────────",
-    ])
+    body_html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;">
+        <div style="background:{'#fff8e1' if level == 'YELLOW' else '#ffebee'};padding:16px;border-radius:8px 8px 0 0;">
+            <h2 style="margin:0;">{emoji} {level} Escalation</h2>
+        </div>
+        <div style="padding:16px;border:1px solid #ddd;border-top:none;">
+            <table style="width:100%;border-collapse:collapse;">
+                <tr><td style="padding:4px 8px;color:#666;">Asked by:</td><td style="padding:4px 8px;"><strong>{asker_name}</strong> ({asker_email})</td></tr>
+                <tr><td style="padding:4px 8px;color:#666;">Date/Time:</td><td style="padding:4px 8px;">{timestamp}</td></tr>
+            </table>
 
-    body = "\n".join(body_lines)
+            <div style="background:#f5f5f5;padding:12px;margin:16px 0;border-radius:4px;">
+                <strong>Question:</strong><br>{question}
+            </div>
 
-    # In production, this sends via Gmail API
-    # For now, returns the email structure for the app to send
-    return {
-        "status": "escalation_prepared",
-        "level": level,
-        "from": SALES_BRAIN_EMAIL,
-        "to": to_list,
-        "cc": [asker_email],
-        "subject": subject,
-        "body": body,
-        "note": "Email will be sent via Gmail API when connected."
-    }
+            <p><strong>Context:</strong> {context}</p>
+
+            {answer_section}
+
+            <hr style="border:none;border-top:2px solid #1a237e;margin:24px 0;">
+
+            <p><strong>When you reply, please indicate:</strong></p>
+            <p>✅ <strong>LEARN</strong> — Add this answer to the Sales Brain's permanent knowledge</p>
+            <p>⛔ <strong>DON'T LEARN</strong> — Log this answer but do NOT add to permanent knowledge (one-off exception)</p>
+            <p style="color:#666;font-size:12px;">Default: DON'T LEARN. Only mark LEARN if this should become standard knowledge.</p>
+
+            <hr style="border:none;border-top:1px solid #ddd;margin:16px 0;">
+            <p style="color:#999;font-size:11px;">Sent by Infinity Hospitality Sales Brain | Powered by Claude</p>
+        </div>
+    </div>
+    """
+
+    # Try to send via Gmail API
+    gmail_service = _get_gmail_service()
+    if gmail_service:
+        try:
+            raw_message = _build_email(to_list, cc_list, subject, body_html, SALES_BRAIN_EMAIL)
+            sent = gmail_service.users().messages().send(
+                userId="me",
+                body={"raw": raw_message}
+            ).execute()
+
+            return {
+                "status": "escalation_sent",
+                "level": level,
+                "message_id": sent.get("id", ""),
+                "from": SALES_BRAIN_EMAIL,
+                "to": to_list,
+                "cc": cc_list,
+                "subject": subject,
+                "note": f"Escalation email sent successfully via Gmail API. Message ID: {sent.get('id', '')}"
+            }
+        except Exception as e:
+            # Gmail send failed — return the prepared email so Claude can report the failure
+            return {
+                "status": "escalation_send_failed",
+                "level": level,
+                "error": str(e),
+                "from": SALES_BRAIN_EMAIL,
+                "to": to_list,
+                "cc": cc_list,
+                "subject": subject,
+                "note": f"Gmail API send failed: {str(e)}. Email was prepared but not delivered."
+            }
+    else:
+        # No Gmail connection — return prepared email
+        return {
+            "status": "escalation_prepared",
+            "level": level,
+            "from": SALES_BRAIN_EMAIL,
+            "to": to_list,
+            "cc": cc_list,
+            "subject": subject,
+            "note": "Gmail API not connected. Email prepared but not sent. Set up domain-wide delegation to enable sending."
+        }
 
 
 def book_date(
