@@ -72,7 +72,7 @@ HUBSPOT_REDIRECT_URI = os.environ.get(
     "HUBSPOT_REDIRECT_URI",
     "https://infinity-sales-brain-production.up.railway.app/hubspot/callback"
 )
-HUBSPOT_SCOPES = "crm.objects.deals.read crm.objects.contacts.read"
+HUBSPOT_SCOPES = "crm.objects.deals.read crm.objects.contacts.read crm.schemas.contacts.read"
 
 # Token file path — Railway persists /app between deploys
 HUBSPOT_TOKEN_FILE = os.path.join(os.path.dirname(__file__), ".hubspot_tokens.json")
