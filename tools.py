@@ -12,8 +12,9 @@ from typing import Optional
 from config import (
     VENUE_CALENDARS, DOWNTOWN_VENUES, WHOLE_VENUE, TBB_SPACES,
     ESCALATION_GROUP, SALES_BRAIN_EMAIL, CONTEXT_FILE, UPDATE_LOG,
-    HUBSPOT_API_KEY
+    QUESTION_LOG_SHEET_ID
 )
+from hubspot_oauth import hubspot_api, is_connected
 
 # ════════════════════════════════════════════════════════════════════
 # TOOL DEFINITIONS — passed to Claude API as tools[]
@@ -547,15 +548,10 @@ def list_open_dates(venue: str, day_of_week: str, start_date: str, end_date: str
 
 
 def lookup_contact(query: str) -> dict:
-    """Search HubSpot for a contact by name, email, or phone."""
-    if not HUBSPOT_API_KEY:
-        return {"error": "HubSpot API key not configured. Set HUBSPOT_API_KEY in Railway Variables."}
+    """Search HubSpot for a contact by name, email, or phone. Uses OAuth."""
+    if not is_connected():
+        return {"error": "HubSpot not connected. An admin needs to visit /hubspot/authorize to link HubSpot."}
 
-    HUBSPOT_BASE = "https://api.hubapi.com"
-    headers = {
-        "Authorization": f"Bearer {HUBSPOT_API_KEY}",
-        "Content-Type": "application/json"
-    }
     properties = [
         "firstname", "lastname", "email", "phone", "company",
         "lifecyclestage", "hs_lead_status", "hubspot_owner_id",
@@ -565,17 +561,14 @@ def lookup_contact(query: str) -> dict:
     # Determine if query looks like email, phone, or name
     query_clean = query.strip()
     if "@" in query_clean:
-        # Email search — exact match
         filter_groups = [{"filters": [
             {"propertyName": "email", "operator": "EQ", "value": query_clean}
         ]}]
     elif query_clean.replace("-", "").replace("(", "").replace(")", "").replace(" ", "").replace("+", "").isdigit():
-        # Phone search
         filter_groups = [{"filters": [
             {"propertyName": "phone", "operator": "CONTAINS_TOKEN", "value": query_clean}
         ]}]
     else:
-        # Name search — split into first/last if possible, otherwise search both
         parts = query_clean.split(None, 1)
         if len(parts) == 2:
             filter_groups = [{"filters": [
@@ -583,7 +576,6 @@ def lookup_contact(query: str) -> dict:
                 {"propertyName": "lastname", "operator": "CONTAINS_TOKEN", "value": f"*{parts[1]}*"}
             ]}]
         else:
-            # Single term — search first OR last name
             filter_groups = [
                 {"filters": [{"propertyName": "firstname", "operator": "CONTAINS_TOKEN", "value": f"*{query_clean}*"}]},
                 {"filters": [{"propertyName": "lastname", "operator": "CONTAINS_TOKEN", "value": f"*{query_clean}*"}]}
@@ -596,13 +588,9 @@ def lookup_contact(query: str) -> dict:
     }
 
     try:
-        resp = requests.post(f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search", headers=headers, json=body, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.HTTPError as e:
-        return {"error": f"HubSpot API error: {e.response.status_code} — {e.response.text[:200]}"}
+        data = hubspot_api("/crm/v3/objects/contacts/search", method="POST", json_body=body)
     except Exception as e:
-        return {"error": f"HubSpot connection failed: {str(e)}"}
+        return {"error": f"HubSpot error: {str(e)}"}
 
     results = data.get("results", [])
     if not results:
@@ -630,15 +618,10 @@ def lookup_contact(query: str) -> dict:
 
 
 def lookup_deal(query: str) -> dict:
-    """Search HubSpot for a deal by client name, event date, or deal name."""
-    if not HUBSPOT_API_KEY:
-        return {"error": "HubSpot API key not configured. Set HUBSPOT_API_KEY in Railway Variables."}
+    """Search HubSpot for a deal by client name, event date, or deal name. Uses OAuth."""
+    if not is_connected():
+        return {"error": "HubSpot not connected. An admin needs to visit /hubspot/authorize to link HubSpot."}
 
-    HUBSPOT_BASE = "https://api.hubapi.com"
-    headers = {
-        "Authorization": f"Bearer {HUBSPOT_API_KEY}",
-        "Content-Type": "application/json"
-    }
     properties = [
         "dealname", "dealstage", "amount", "closedate",
         "pipeline", "hubspot_owner_id", "createdate",
@@ -647,7 +630,6 @@ def lookup_deal(query: str) -> dict:
 
     query_clean = query.strip()
 
-    # Search deal name with CONTAINS_TOKEN
     filter_groups = [
         {"filters": [{"propertyName": "dealname", "operator": "CONTAINS_TOKEN", "value": f"*{query_clean}*"}]}
     ]
@@ -659,13 +641,9 @@ def lookup_deal(query: str) -> dict:
     }
 
     try:
-        resp = requests.post(f"{HUBSPOT_BASE}/crm/v3/objects/deals/search", headers=headers, json=body, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.HTTPError as e:
-        return {"error": f"HubSpot API error: {e.response.status_code} — {e.response.text[:200]}"}
+        data = hubspot_api("/crm/v3/objects/deals/search", method="POST", json_body=body)
     except Exception as e:
-        return {"error": f"HubSpot connection failed: {str(e)}"}
+        return {"error": f"HubSpot error: {str(e)}"}
 
     results = data.get("results", [])
     if not results:
@@ -1049,3 +1027,70 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
         return json.dumps(result, indent=2, default=str)
     except Exception as e:
         return json.dumps({"error": f"Tool execution failed: {str(e)}"})
+
+
+# ════════════════════════════════════════════════════════════════════
+# QUESTION LOG — appends every Q&A to a Google Sheet
+# ════════════════════════════════════════════════════════════════════
+
+def log_question(user_name: str, user_email: str, question: str, response: str, confidence: str, escalated: bool):
+    """
+    Append a row to the Sales Brain Question Log Google Sheet.
+    Fails silently so a Sheets error never breaks the chat.
+
+    Sheet columns: Timestamp | User | Email | Question | Confidence | Escalated | Response (truncated)
+
+    Setup:
+      1. Create a Google Sheet and copy the ID from the URL
+      2. Share it with the service account email as Editor
+      3. Set QUESTION_LOG_SHEET_ID in Railway Variables
+    """
+    if not QUESTION_LOG_SHEET_ID:
+        return  # Not configured — skip silently
+
+    try:
+        SCOPES = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/calendar",
+        ]
+        from googleapiclient.discovery import build
+
+        sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+        sa_path = os.environ.get("GOOGLE_SERVICE_ACCOUNT_KEY", "")
+
+        if sa_json:
+            from google.oauth2 import service_account
+            import json as _json
+            info = _json.loads(sa_json)
+            creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        elif sa_path and os.path.exists(sa_path):
+            from google.oauth2 import service_account
+            creds = service_account.Credentials.from_service_account_file(sa_path, scopes=SCOPES)
+        else:
+            return  # No credentials available
+
+        sheets = build("sheets", "v4", credentials=creds)
+
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        response_snippet = response[:500] + "..." if len(response) > 500 else response
+
+        row = [[
+            timestamp,
+            user_name or "Unknown",
+            user_email or "",
+            question,
+            confidence,
+            "Yes" if escalated else "No",
+            response_snippet,
+        ]]
+
+        sheets.spreadsheets().values().append(
+            spreadsheetId=QUESTION_LOG_SHEET_ID,
+            range="Sheet1!A:G",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": row},
+        ).execute()
+
+    except Exception:
+        pass  # Never let logging break the chat

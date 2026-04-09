@@ -7,12 +7,17 @@ import os
 import json
 import datetime
 import anthropic
-from flask import Flask, request, jsonify, render_template, session
+from flask import Flask, request, jsonify, render_template, session, redirect
 from config import (
     ANTHROPIC_API_KEY, CLAUDE_MODEL, CONTEXT_FILE,
-    GREEN_THRESHOLD, YELLOW_THRESHOLD, ESCALATION_GROUP, SALES_BRAIN_EMAIL
+    GREEN_THRESHOLD, YELLOW_THRESHOLD, ESCALATION_GROUP, SALES_BRAIN_EMAIL,
+    HUBSPOT_CLIENT_ID,
 )
-from tools import TOOL_DEFINITIONS, execute_tool
+from tools import TOOL_DEFINITIONS, execute_tool, log_question
+from hubspot_oauth import (
+    get_authorize_url, exchange_code, store_tokens, clear_tokens,
+    get_access_token, is_connected,
+)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(32))
@@ -152,6 +157,11 @@ def chat_with_brain(user_message: str, session_id: str, user_name: str = "Sales 
             elif "🟡" in final_text:
                 confidence = "YELLOW"
 
+            # If an escalation was sent, use its level for the chat color
+            # (Claude's wrap-up text after escalation may not always contain the emoji)
+            if escalation_data and confidence == "GREEN":
+                confidence = escalation_data.get("level", "RED")
+
             return {
                 "response": final_text,
                 "confidence": confidence,
@@ -224,6 +234,15 @@ def api_chat():
 
     try:
         result = chat_with_brain(user_message, session_id, user_name, user_email)
+        # Log every question to Google Sheet (fails silently if not configured)
+        log_question(
+            user_name=user_name,
+            user_email=user_email,
+            question=user_message,
+            response=result.get("response", ""),
+            confidence=result.get("confidence", "GREEN"),
+            escalated=bool(result.get("escalation")),
+        )
         return jsonify(result)
     except anthropic.AuthenticationError:
         return jsonify({"error": "Invalid Anthropic API key. Check your ANTHROPIC_API_KEY."}), 401
@@ -243,6 +262,72 @@ def api_clear():
     return jsonify({"status": "cleared"})
 
 
+# ════════════════════════════════════════════════════════════════════
+# HUBSPOT OAUTH ROUTES
+# ════════════════════════════════════════════════════════════════════
+
+@app.route("/hubspot/authorize")
+def hubspot_authorize():
+    """Start the HubSpot OAuth flow — redirects to HubSpot login."""
+    if not HUBSPOT_CLIENT_ID:
+        return "<h2>HubSpot not configured</h2><p>Set HUBSPOT_CLIENT_ID, HUBSPOT_CLIENT_SECRET, and HUBSPOT_REDIRECT_URI in Railway Variables.</p>", 500
+    return redirect(get_authorize_url())
+
+
+@app.route("/hubspot/callback")
+def hubspot_callback():
+    """Handle OAuth callback from HubSpot after user authorizes."""
+    code = request.args.get("code")
+    if not code:
+        return "<h2>Error</h2><p>Missing authorization code from HubSpot.</p>", 400
+
+    try:
+        exchange_code(code)
+        return """
+        <html>
+        <body style="font-family: Inter, sans-serif; display:flex; align-items:center; justify-content:center; height:100vh; background:#f5f0ea;">
+            <div style="text-align:center; background:white; padding:40px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+                <h2 style="color:#1B3A5C;">HubSpot Connected!</h2>
+                <p>The Sales Brain can now look up contacts and deals.</p>
+                <a href="/" style="display:inline-block; margin-top:16px; padding:10px 24px; background:#1B3A5C; color:white; text-decoration:none; border-radius:6px;">Return to Sales Brain</a>
+            </div>
+        </body>
+        </html>
+        """
+    except Exception as e:
+        return f"<h2>OAuth Failed</h2><p>{str(e)}</p><p><a href='/hubspot/authorize'>Try again</a></p>", 400
+
+
+@app.route("/hubspot/status")
+def hubspot_status():
+    """Check if HubSpot is connected and tokens are valid."""
+    connected = is_connected()
+    if connected:
+        try:
+            token = get_access_token()
+            # Verify token by hitting the token info endpoint
+            import requests as req
+            info = req.get(f"https://api.hubapi.com/oauth/v1/access-tokens/{token}", timeout=5)
+            if info.ok:
+                data = info.json()
+                return jsonify({
+                    "connected": True,
+                    "hub_id": data.get("hub_id"),
+                    "user": data.get("user"),
+                    "scopes": data.get("scopes"),
+                })
+        except Exception:
+            pass
+    return jsonify({"connected": connected})
+
+
+@app.route("/hubspot/disconnect")
+def hubspot_disconnect():
+    """Remove HubSpot OAuth tokens."""
+    clear_tokens()
+    return jsonify({"disconnected": True, "message": "HubSpot connection removed. Visit /hubspot/authorize to reconnect."})
+
+
 @app.route("/api/health", methods=["GET"])
 def api_health():
     """Health check endpoint."""
@@ -254,7 +339,7 @@ def api_health():
         "api_key_set": bool(ANTHROPIC_API_KEY),
         "context_loaded": os.path.exists(CONTEXT_FILE),
         "google_calendar_connected": cal_ok,
-        "hubspot_connected": bool(os.environ.get("HUBSPOT_API_KEY", "")),
+        "hubspot_connected": is_connected(),
         "timestamp": datetime.datetime.now().isoformat(),
     })
 
@@ -292,9 +377,13 @@ if __name__ == "__main__":
             print("  Calendar:  ⚠️  Not configured — run setup_google_auth.py or set env vars")
             print("             (Date availability will return 'not connected' until configured)")
 
-    # Check HubSpot
-    hubspot_key = os.environ.get("HUBSPOT_API_KEY", "")
-    print(f"  HubSpot:   {'✅ Set' if hubspot_key else '⚠️  Not set (contact/deal lookup disabled)'}")
+    # Check HubSpot OAuth
+    if is_connected():
+        print("  HubSpot:   ✅ Connected (OAuth)")
+    elif HUBSPOT_CLIENT_ID:
+        print("  HubSpot:   ⚠️  OAuth configured but not connected — visit /hubspot/authorize")
+    else:
+        print("  HubSpot:   ❌ Not configured — set HUBSPOT_CLIENT_ID + HUBSPOT_CLIENT_SECRET on Railway")
 
     print(f"  URL:       http://localhost:5000")
     print("=" * 60)

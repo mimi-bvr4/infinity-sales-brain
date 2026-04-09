@@ -63,8 +63,24 @@ ESCALATION_GROUP = [
 
 SALES_BRAIN_EMAIL = "salesbrain@infinityhospitality.net"
 
-# ── HubSpot ────────────────────────────────────────────────────────
-HUBSPOT_API_KEY = os.environ.get("HUBSPOT_API_KEY", "")
+# ── HubSpot OAuth 2.0 ─────────────────────────────────────────────
+# Register an app in HubSpot Developer Portal to get these values.
+# Set them as environment variables on Railway.
+HUBSPOT_CLIENT_ID = os.environ.get("HUBSPOT_CLIENT_ID", "")
+HUBSPOT_CLIENT_SECRET = os.environ.get("HUBSPOT_CLIENT_SECRET", "")
+HUBSPOT_REDIRECT_URI = os.environ.get(
+    "HUBSPOT_REDIRECT_URI",
+    "https://infinity-sales-brain-production.up.railway.app/hubspot/callback"
+)
+HUBSPOT_SCOPES = "crm.objects.deals.read crm.objects.contacts.read"
+
+# Token file path — Railway persists /app between deploys
+HUBSPOT_TOKEN_FILE = os.path.join(os.path.dirname(__file__), ".hubspot_tokens.json")
+
+# ── Question Log (Google Sheets) ───────────────────────────────────
+# Create a Google Sheet, share it with the service account email (editor),
+# and paste the Sheet ID here (the long ID in the URL between /d/ and /edit)
+QUESTION_LOG_SHEET_ID = os.environ.get("QUESTION_LOG_SHEET_ID", "")
 
 # ── Paths ──────────────────────────────────────────────────────────
 CONTEXT_FILE = os.path.join(os.path.dirname(__file__), "Sales_Brain_Context.md")
