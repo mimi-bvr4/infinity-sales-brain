@@ -67,8 +67,8 @@ SALES_BRAIN_EMAIL = "salesbrain@infinityhospitality.net"
 HUBSPOT_API_KEY = os.environ.get("HUBSPOT_API_KEY", "")
 
 # ── Paths ──────────────────────────────────────────────────────────
-CONTEXT_FILE = os.path.join(os.path.dirname(__file__), "..", "Sales_Brain_Context.md")
-UPDATE_LOG = os.path.join(os.path.dirname(__file__), "..", "Sales_Brain_Update_Log.md")
+CONTEXT_FILE = os.path.join(os.path.dirname(__file__), "Sales_Brain_Context.md")
+UPDATE_LOG = os.path.join(os.path.dirname(__file__), "Sales_Brain_Update_Log.md")
 
 # ── Confidence thresholds ──────────────────────────────────────────
 GREEN_THRESHOLD = 0.90
