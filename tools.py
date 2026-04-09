@@ -5,11 +5,14 @@ Each function maps to a real API (Google Calendar, HubSpot, Gmail).
 """
 
 import json
+import os
 import datetime
+import requests
 from typing import Optional
 from config import (
     VENUE_CALENDARS, DOWNTOWN_VENUES, WHOLE_VENUE, TBB_SPACES,
-    ESCALATION_GROUP, SALES_BRAIN_EMAIL, CONTEXT_FILE, UPDATE_LOG
+    ESCALATION_GROUP, SALES_BRAIN_EMAIL, CONTEXT_FILE, UPDATE_LOG,
+    HUBSPOT_API_KEY
 )
 
 # ════════════════════════════════════════════════════════════════════
@@ -544,24 +547,148 @@ def list_open_dates(venue: str, day_of_week: str, start_date: str, end_date: str
 
 
 def lookup_contact(query: str) -> dict:
-    """Search HubSpot for a contact. Wraps the HubSpot MCP search."""
-    # In production, this calls the HubSpot API directly
-    # For now, returns a structured placeholder that the app will fill via HubSpot MCP
+    """Search HubSpot for a contact by name, email, or phone."""
+    if not HUBSPOT_API_KEY:
+        return {"error": "HubSpot API key not configured. Set HUBSPOT_API_KEY in Railway Variables."}
+
+    HUBSPOT_BASE = "https://api.hubapi.com"
+    headers = {
+        "Authorization": f"Bearer {HUBSPOT_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    properties = [
+        "firstname", "lastname", "email", "phone", "company",
+        "lifecyclestage", "hs_lead_status", "hubspot_owner_id",
+        "notes_last_updated", "createdate"
+    ]
+
+    # Determine if query looks like email, phone, or name
+    query_clean = query.strip()
+    if "@" in query_clean:
+        # Email search — exact match
+        filter_groups = [{"filters": [
+            {"propertyName": "email", "operator": "EQ", "value": query_clean}
+        ]}]
+    elif query_clean.replace("-", "").replace("(", "").replace(")", "").replace(" ", "").replace("+", "").isdigit():
+        # Phone search
+        filter_groups = [{"filters": [
+            {"propertyName": "phone", "operator": "CONTAINS_TOKEN", "value": query_clean}
+        ]}]
+    else:
+        # Name search — split into first/last if possible, otherwise search both
+        parts = query_clean.split(None, 1)
+        if len(parts) == 2:
+            filter_groups = [{"filters": [
+                {"propertyName": "firstname", "operator": "CONTAINS_TOKEN", "value": f"*{parts[0]}*"},
+                {"propertyName": "lastname", "operator": "CONTAINS_TOKEN", "value": f"*{parts[1]}*"}
+            ]}]
+        else:
+            # Single term — search first OR last name
+            filter_groups = [
+                {"filters": [{"propertyName": "firstname", "operator": "CONTAINS_TOKEN", "value": f"*{query_clean}*"}]},
+                {"filters": [{"propertyName": "lastname", "operator": "CONTAINS_TOKEN", "value": f"*{query_clean}*"}]}
+            ]
+
+    body = {
+        "filterGroups": filter_groups,
+        "properties": properties,
+        "limit": 5
+    }
+
+    try:
+        resp = requests.post(f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search", headers=headers, json=body, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.HTTPError as e:
+        return {"error": f"HubSpot API error: {e.response.status_code} — {e.response.text[:200]}"}
+    except Exception as e:
+        return {"error": f"HubSpot connection failed: {str(e)}"}
+
+    results = data.get("results", [])
+    if not results:
+        return {"query": query, "results": [], "message": f"No contacts found matching '{query}'."}
+
+    contacts = []
+    for r in results:
+        props = r.get("properties", {})
+        contacts.append({
+            "id": r.get("id"),
+            "name": f"{props.get('firstname', '')} {props.get('lastname', '')}".strip(),
+            "email": props.get("email", ""),
+            "phone": props.get("phone", ""),
+            "company": props.get("company", ""),
+            "lifecycle_stage": props.get("lifecyclestage", ""),
+            "lead_status": props.get("hs_lead_status", ""),
+            "created": props.get("createdate", "")
+        })
+
     return {
-        "tool": "hubspot_search",
-        "object_type": "contacts",
         "query": query,
-        "note": "This function will use the HubSpot API. Connect your HubSpot API key in config.py."
+        "total_found": data.get("total", len(results)),
+        "results": contacts
     }
 
 
 def lookup_deal(query: str) -> dict:
-    """Search HubSpot for a deal."""
+    """Search HubSpot for a deal by client name, event date, or deal name."""
+    if not HUBSPOT_API_KEY:
+        return {"error": "HubSpot API key not configured. Set HUBSPOT_API_KEY in Railway Variables."}
+
+    HUBSPOT_BASE = "https://api.hubapi.com"
+    headers = {
+        "Authorization": f"Bearer {HUBSPOT_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    properties = [
+        "dealname", "dealstage", "amount", "closedate",
+        "pipeline", "hubspot_owner_id", "createdate",
+        "hs_lastmodifieddate", "notes_last_updated"
+    ]
+
+    query_clean = query.strip()
+
+    # Search deal name with CONTAINS_TOKEN
+    filter_groups = [
+        {"filters": [{"propertyName": "dealname", "operator": "CONTAINS_TOKEN", "value": f"*{query_clean}*"}]}
+    ]
+
+    body = {
+        "filterGroups": filter_groups,
+        "properties": properties,
+        "limit": 5
+    }
+
+    try:
+        resp = requests.post(f"{HUBSPOT_BASE}/crm/v3/objects/deals/search", headers=headers, json=body, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.HTTPError as e:
+        return {"error": f"HubSpot API error: {e.response.status_code} — {e.response.text[:200]}"}
+    except Exception as e:
+        return {"error": f"HubSpot connection failed: {str(e)}"}
+
+    results = data.get("results", [])
+    if not results:
+        return {"query": query, "results": [], "message": f"No deals found matching '{query}'."}
+
+    deals = []
+    for r in results:
+        props = r.get("properties", {})
+        deals.append({
+            "id": r.get("id"),
+            "deal_name": props.get("dealname", ""),
+            "stage": props.get("dealstage", ""),
+            "amount": props.get("amount", ""),
+            "close_date": props.get("closedate", ""),
+            "pipeline": props.get("pipeline", ""),
+            "created": props.get("createdate", ""),
+            "last_modified": props.get("hs_lastmodifieddate", "")
+        })
+
     return {
-        "tool": "hubspot_search",
-        "object_type": "deals",
         "query": query,
-        "note": "This function will use the HubSpot API. Connect your HubSpot API key in config.py."
+        "total_found": data.get("total", len(results)),
+        "results": deals
     }
 
 
