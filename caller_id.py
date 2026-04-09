@@ -22,6 +22,9 @@ caller_id_bp = Blueprint("caller_id", __name__)
 # Cleared on dismiss or redeploy — intentional, calls are transient
 active_calls = {}
 
+# ── Accepted inbound call event names ─────────────────────────────
+INBOUND_CALL_EVENTS = {"call.received", "call.inbound_started"}
+
 
 # ════════════════════════════════════════════════════════════════════
 # ROUTES
@@ -30,22 +33,22 @@ active_calls = {}
 @caller_id_bp.route("/webhook/salesmsg", methods=["POST"])
 def salesmsg_webhook():
     """
-    Receives call.received webhook from SalesMsg.
+    Receives inbound call webhook from SalesMsg.
     SalesMsg expects a fast 200 — all HubSpot work happens synchronously
     but is quick enough (single contact lookup) to be fine here.
     """
     data = request.json or {}
 
-    # Debug: log raw payload on first few calls to confirm field names
+    # Debug: log raw payload to confirm field names on first calls
     print(f"[caller_id] SalesMsg webhook received: {json.dumps(data)}")
 
     event_type = data.get("event") or data.get("type") or data.get("event_type", "")
     called_number = data.get("to_number") or data.get("called_number") or data.get("to", "")
     caller_number = data.get("from_number") or data.get("caller_number") or data.get("from", "")
 
-    # Only handle inbound calls
-    if event_type != "call.received":
-        return jsonify({"status": "ignored", "reason": "not call.received"}), 200
+    # Only handle inbound call events
+    if event_type not in INBOUND_CALL_EVENTS:
+        return jsonify({"status": "ignored", "reason": f"unhandled event type: {event_type}"}), 200
 
     # Only handle monitored sales lines
     normalized_called = normalize_phone(called_number)
